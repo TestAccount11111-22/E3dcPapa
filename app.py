@@ -1,0 +1,377 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from io import BytesIO
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"]
+MONTH_NAME_MAP = {index + 1: name for index, name in enumerate(MONTH_LABELS)}
+
+VALUE_CONFIG = {
+    "Solarproduktion": {"column": "Solarproduktion", "category": "solar"},
+    "Solarproduktion Tracker 1": {"column": "Solarproduktion-Tracker 1", "category": "solar"},
+    "Solarproduktion Tracker 2": {"column": "Solarproduktion-Tracker 2", "category": "solar"},
+    "Batterie Laden": {"column": "Batterie Laden", "category": "battery"},
+    "Batterie Entladen": {"column": "Batterie Entladen", "category": "battery"},
+    "Netzeinspeisung": {"column": "Netzeinspeisung", "category": "grid"},
+    "Netzbezug": {"column": "Netzbezug", "category": "grid"},
+    "Hausverbrauch": {"column": "Hausverbrauch", "category": "consumption"},
+    "Summe Wallbox Laden": {"column": "Summe Wallbox Laden", "category": "consumption"},
+    "Wallbox Solarladeleistung": {"column": "Wallbox Solarladeleistung", "category": "solar"},
+    "Summe Verbrauch": {"column": "Summe Verbrauch", "category": "consumption"},
+}
+
+DEFAULT_VALUES = {"Solarproduktion", "Netzbezug"}
+
+ALL_DATA_COLUMNS = {
+    config["column"] for config in VALUE_CONFIG.values()
+}.union({"Netzeinspeisung", "Netzbezug", "Hausverbrauch", "Solarproduktion"})
+
+YEAR_PALETTE = [
+    "#F59E0B",
+    "#3B82F6",
+    "#22C55E",
+    "#6B7280",
+    "#FBBF24",
+    "#0EA5E9",
+    "#84CC16",
+]
+
+VALUE_ORDER = list(VALUE_CONFIG.keys())
+
+
+@dataclass
+class Dataset:
+    label: str
+    year: Optional[int]
+    raw: pd.DataFrame
+    monthly: pd.DataFrame
+    warnings: list[str]
+
+    @property
+    def display_year(self) -> str:
+        return str(self.year) if self.year is not None else self.label
+
+
+def parse_german_csv(content: bytes) -> pd.DataFrame:
+    df = pd.read_csv(
+        BytesIO(content),
+        sep=";",
+        encoding="utf-8-sig",
+        dtype=str,
+    )
+    df.columns = [col.strip() for col in df.columns]
+
+    if "Zeitstempel" in df.columns:
+        df["Zeitstempel"] = pd.to_datetime(
+            df["Zeitstempel"].astype(str).str.strip(),
+            format="%d.%m.%Y",
+            errors="coerce",
+        )
+
+    for col in df.columns:
+        if col == "Zeitstempel":
+            continue
+        series = df[col].astype(str).str.strip()
+        series = series.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+        df[col] = pd.to_numeric(series, errors="coerce")
+
+    return df
+
+
+def format_number_de(value: float, decimals: int = 1) -> str:
+    text = f"{value:,.{decimals}f}"
+    return text.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def format_kwh(value_wh: Optional[float]) -> str:
+    if value_wh is None or pd.isna(value_wh):
+        return "k.A."
+    return f"{format_number_de(value_wh / 1000)} kWh"
+
+
+def format_percent(value: Optional[float]) -> str:
+    if value is None or pd.isna(value):
+        return "k.A."
+    return f"{format_number_de(value, 1)} %"
+
+
+def shade_color(hex_color: str, factor: float) -> str:
+    hex_color = hex_color.lstrip("#")
+    red = int(hex_color[0:2], 16)
+    green = int(hex_color[2:4], 16)
+    blue = int(hex_color[4:6], 16)
+    red = int(red * factor + 255 * (1 - factor))
+    green = int(green * factor + 255 * (1 - factor))
+    blue = int(blue * factor + 255 * (1 - factor))
+    return f"#{red:02x}{green:02x}{blue:02x}"
+
+
+def value_shade_factor(value_name: str) -> float:
+    idx = VALUE_ORDER.index(value_name)
+    return max(0.35, 0.95 - idx * 0.06)
+
+
+def load_dataset(name: str, content: bytes) -> Dataset:
+    warnings: list[str] = []
+    df = parse_german_csv(content)
+
+    if "Zeitstempel" not in df.columns:
+        warnings.append("Spalte 'Zeitstempel' fehlt.")
+        df["Zeitstempel"] = pd.NaT
+
+    missing_columns = [col for col in sorted(ALL_DATA_COLUMNS) if col not in df.columns]
+    for col in missing_columns:
+        df[col] = pd.NA
+    if missing_columns:
+        warnings.append("Fehlende Spalten: " + ", ".join(missing_columns))
+
+    year = None
+    timestamps = df["Zeitstempel"].dropna()
+    if not timestamps.empty:
+        year = int(timestamps.iloc[0].year)
+    else:
+        warnings.append("Jahr konnte nicht erkannt werden.")
+
+    df = df.sort_values("Zeitstempel")
+    df["Monat"] = df["Zeitstempel"].dt.month
+
+    numeric_cols = [col for col in df.columns if col not in ("Zeitstempel", "Monat")]
+    present_numeric_cols = [col for col in numeric_cols if col not in missing_columns]
+
+    df_monthly = (
+        df.groupby("Monat")[numeric_cols]
+        .sum(min_count=1)
+        .reindex(range(1, 13))
+    )
+
+    months_found = sorted(int(m) for m in df["Monat"].dropna().unique())
+    if len(months_found) != 12:
+        missing_months = [MONTH_NAME_MAP[m] for m in range(1, 13) if m not in months_found]
+        warnings.append("Es fehlen Monate: " + ", ".join(missing_months))
+
+    if present_numeric_cols:
+        if (df_monthly[present_numeric_cols] < 0).any().any():
+            warnings.append("Es gibt negative Werte, bitte pruefen.")
+        if df_monthly[present_numeric_cols].isna().any().any():
+            warnings.append("Nicht-numerische oder fehlende Werte gefunden.")
+
+    return Dataset(label=name, year=year, raw=df, monthly=df_monthly, warnings=warnings)
+
+
+def build_year_colors(labels: list[str]) -> dict[str, str]:
+    colors: dict[str, str] = {}
+    for idx, label in enumerate(labels):
+        base_color = YEAR_PALETTE[idx % len(YEAR_PALETTE)]
+        if idx >= len(YEAR_PALETTE):
+            shade = max(0.55, 0.85 - 0.1 * (idx // len(YEAR_PALETTE)))
+            base_color = shade_color(base_color, shade)
+        colors[label] = base_color
+    return colors
+
+
+def build_kpis(dataset: Dataset) -> dict[str, Optional[float]]:
+    def sum_wh(column: str) -> Optional[float]:
+        if column not in dataset.monthly.columns:
+            return None
+        return dataset.monthly[column].sum(min_count=1)
+
+    solar_total = sum_wh("Solarproduktion")
+    netzeinspeisung_total = sum_wh("Netzeinspeisung")
+    netzbezug_total = sum_wh("Netzbezug")
+    hausverbrauch_total = sum_wh("Hausverbrauch")
+
+    eigenverbrauch = None
+    if solar_total is not None and netzeinspeisung_total is not None and solar_total > 0:
+        eigenverbrauch = (solar_total - netzeinspeisung_total) / solar_total * 100
+
+    autarkie = None
+    if hausverbrauch_total is not None and netzbezug_total is not None and hausverbrauch_total > 0:
+        autarkie = (hausverbrauch_total - netzbezug_total) / hausverbrauch_total * 100
+
+    return {
+        "solar_total": solar_total,
+        "eigenverbrauch": eigenverbrauch,
+        "autarkie": autarkie,
+        "netzbezug_total": netzbezug_total,
+    }
+
+
+def main() -> None:
+    st.set_page_config(page_title="E3DC Jahresvergleich", layout="wide")
+    st.title("E3DC Jahresvergleich")
+
+    st.sidebar.header("Dateien")
+    uploads = st.sidebar.file_uploader(
+        "CSV-Dateien hochladen",
+        type=["csv"],
+        accept_multiple_files=True,
+    )
+
+    datasets: list[Dataset] = []
+
+    if uploads:
+        for upload in uploads:
+            datasets.append(load_dataset(upload.name, upload.getvalue()))
+    else:
+        sample_path = Path(__file__).resolve().parent / "2026_All_in.csv"
+        if sample_path.exists():
+            use_sample = st.sidebar.checkbox(
+                "Beispieldaten laden (2026_All_in.csv)",
+                value=False,
+            )
+            if use_sample:
+                datasets.append(load_dataset(sample_path.name, sample_path.read_bytes()))
+
+    if not datasets:
+        st.info("Bitte eine oder mehrere CSV-Dateien hochladen.")
+        return
+
+    datasets = sorted(
+        datasets,
+        key=lambda item: (item.year is None, item.year or 0, item.label),
+    )
+
+    st.sidebar.subheader("Jahr-Auswahl")
+    selected_labels: list[str] = []
+    for dataset in datasets:
+        if st.sidebar.checkbox(dataset.display_year, value=True, key=f"year_{dataset.label}"):
+            selected_labels.append(dataset.label)
+
+    st.sidebar.subheader("Werte-Auswahl")
+    selected_values: list[str] = []
+    for value_name in VALUE_ORDER:
+        if st.sidebar.checkbox(
+            value_name,
+            value=value_name in DEFAULT_VALUES,
+            key=f"value_{value_name}",
+        ):
+            selected_values.append(value_name)
+
+    selected_datasets = [item for item in datasets if item.label in selected_labels]
+
+    for dataset in datasets:
+        for warning in dataset.warnings:
+            st.warning(f"{dataset.display_year}: {warning}")
+
+    tabs = st.tabs(["Jahr gesamt", "Monatliche Aufschluesselung", "Rohdaten"])
+
+    with tabs[0]:
+        st.subheader("Jahr gesamt")
+        if not selected_values:
+            st.info("Bitte mindestens einen Wert auswaehlen.")
+        elif not selected_datasets:
+            st.info("Bitte mindestens ein Jahr auswaehlen.")
+        else:
+            year_colors = build_year_colors([ds.label for ds in selected_datasets])
+            fig_total = go.Figure()
+            for dataset in selected_datasets:
+                year_color = year_colors[dataset.label]
+                for value_name in selected_values:
+                    column = VALUE_CONFIG[value_name]["column"]
+                    total_wh = dataset.monthly[column].sum(min_count=1)
+                    total_kwh = None if total_wh is None or pd.isna(total_wh) else total_wh / 1000
+                    shade = value_shade_factor(value_name)
+                    color = shade_color(year_color, shade)
+                    fig_total.add_trace(
+                        go.Bar(
+                            x=[dataset.display_year],
+                            y=[total_kwh],
+                            name=f"{dataset.display_year} {value_name}",
+                            marker=dict(color=color),
+                            hovertemplate=(
+                                f"{dataset.display_year}<br>{value_name}: "
+                                "%{y:.1f} kWh<extra></extra>"
+                            ),
+                        )
+                    )
+
+            fig_total.update_layout(
+                barmode="group",
+                legend_title_text="Jahr und Wert",
+                xaxis_title="Jahr",
+                yaxis_title="kWh",
+                bargap=0.18,
+                bargroupgap=0.08,
+                template="plotly_white",
+            )
+            st.plotly_chart(fig_total, use_container_width=True)
+
+            totals_table = pd.DataFrame(
+                {
+                    f"{dataset.display_year}": {
+                        f"{value_name} (kWh)": (
+                            None
+                            if (total := dataset.monthly[VALUE_CONFIG[value_name]["column"]].sum(min_count=1)) is None
+                            or pd.isna(total)
+                            else total / 1000
+                        )
+                        for value_name in selected_values
+                    }
+                    for dataset in selected_datasets
+                }
+            ).T
+            st.dataframe(totals_table, use_container_width=True)
+
+    with tabs[1]:
+        st.subheader("Monatliche Aufschluesselung")
+        if not selected_values:
+            st.info("Bitte mindestens einen Wert auswaehlen.")
+        elif not selected_datasets:
+            st.info("Bitte mindestens ein Jahr auswaehlen.")
+        else:
+            year_colors = build_year_colors([ds.label for ds in selected_datasets])
+            fig = go.Figure()
+            for dataset in selected_datasets:
+                year_color = year_colors[dataset.label]
+                for value_name in selected_values:
+                    column = VALUE_CONFIG[value_name]["column"]
+                    shade = value_shade_factor(value_name)
+                    color = shade_color(year_color, shade)
+                    y_values = dataset.monthly[column] / 1000
+                    fig.add_trace(
+                        go.Bar(
+                            x=MONTH_LABELS,
+                            y=y_values,
+                            name=f"{dataset.display_year} {value_name}",
+                            marker=dict(color=color),
+                            hovertemplate=(
+                                f"%{{x}} {dataset.display_year}<br>{value_name}: "
+                                "%{y:.1f} kWh<extra></extra>"
+                            ),
+                        )
+                    )
+
+            fig.update_layout(
+                barmode="group",
+                legend_title_text="Jahr und Wert",
+                xaxis_title="Monat",
+                yaxis_title="kWh",
+                bargap=0.18,
+                bargroupgap=0.08,
+                template="plotly_white",
+            )
+            fig.update_xaxes(categoryorder="array", categoryarray=MONTH_LABELS)
+            st.plotly_chart(fig, use_container_width=True)
+
+            table = pd.DataFrame(index=MONTH_LABELS)
+            for dataset in selected_datasets:
+                for value_name in selected_values:
+                    column = VALUE_CONFIG[value_name]["column"]
+                    series = dataset.monthly[column] / 1000
+                    table[f"{dataset.display_year} {value_name}"] = series.values
+            st.dataframe(table, use_container_width=True)
+
+    with tabs[2]:
+        for dataset in datasets:
+            st.markdown(f"**{dataset.display_year}**")
+            st.dataframe(dataset.raw, use_container_width=True)
+
+
+if __name__ == "__main__":
+    main()
