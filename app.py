@@ -143,6 +143,14 @@ def load_dataset(name: str, content: bytes) -> Dataset:
     if missing_columns:
         warnings.append("Fehlende Spalten: " + ", ".join(missing_columns))
 
+    wallbox_fallbacks = {
+        "Summe Wallbox Laden": "Summe Wallbox Laden ID: 0",
+        "Wallbox Solarladeleistung": "Wallbox Solarladeleistung ID: 0",
+    }
+    for primary, fallback in wallbox_fallbacks.items():
+        if primary in df.columns and fallback in df.columns:
+            df[primary] = df[primary].combine_first(df[fallback])
+
     year = None
     timestamps = df["Zeitstempel"].dropna()
     if not timestamps.empty:
