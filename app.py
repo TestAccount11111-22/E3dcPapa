@@ -194,16 +194,17 @@ def main() -> None:
         accept_multiple_files=True,
     )
 
-    datasets: list[Dataset] = []
+    datasets_by_label: dict[str, Dataset] = {}
+    data_dir = Path(__file__).resolve().parent
+    local_files = sorted(data_dir.glob("*_All_in.csv"))
+    for path in local_files:
+        datasets_by_label[path.name] = load_dataset(path.name, path.read_bytes())
 
     if uploads:
         for upload in uploads:
-            datasets.append(load_dataset(upload.name, upload.getvalue()))
-    else:
-        data_dir = Path(__file__).resolve().parent
-        local_files = sorted(data_dir.glob("*_All_in.csv"))
-        for path in local_files:
-            datasets.append(load_dataset(path.name, path.read_bytes()))
+            datasets_by_label[upload.name] = load_dataset(upload.name, upload.getvalue())
+
+    datasets = list(datasets_by_label.values())
 
     if not datasets:
         st.info("Bitte eine oder mehrere CSV-Dateien hochladen oder CSVs im Ordner ablegen.")
@@ -350,6 +351,7 @@ def main() -> None:
         for dataset in datasets:
             st.markdown(f"**{dataset.display_year}**")
             st.dataframe(dataset.raw, use_container_width=True)
+
 
 if __name__ == "__main__":
     main()
