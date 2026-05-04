@@ -62,19 +62,38 @@ class Dataset:
         return str(self.year) if self.year is not None else self.label
 
 
+def read_csv_robust(content: bytes) -> pd.DataFrame:
+    encodings = ["utf-8-sig", "cp1252", "latin-1"]
+    seps = [";", ",", "\t"]
+
+    for encoding in encodings:
+        for sep in seps:
+            try:
+                df = pd.read_csv(BytesIO(content), sep=sep, encoding=encoding, dtype=str)
+            except Exception:
+                continue
+            if df.shape[1] > 1:
+                return df
+
+    for encoding in encodings:
+        try:
+            df = pd.read_csv(BytesIO(content), sep=None, engine="python", encoding=encoding, dtype=str)
+        except Exception:
+            continue
+        if df.shape[1] > 1:
+            return df
+
+    return pd.read_csv(BytesIO(content), sep=";", encoding="utf-8-sig", dtype=str)
+
+
 def parse_german_csv(content: bytes) -> pd.DataFrame:
-    df = pd.read_csv(
-        BytesIO(content),
-        sep=";",
-        encoding="utf-8-sig",
-        dtype=str,
-    )
+    df = read_csv_robust(content)
     df.columns = [col.strip() for col in df.columns]
 
     if "Zeitstempel" in df.columns:
         df["Zeitstempel"] = pd.to_datetime(
             df["Zeitstempel"].astype(str).str.strip(),
-            format="%d.%m.%Y",
+            dayfirst=True,
             errors="coerce",
         )
 
@@ -82,6 +101,7 @@ def parse_german_csv(content: bytes) -> pd.DataFrame:
         if col == "Zeitstempel":
             continue
         series = df[col].astype(str).str.strip()
+        series = series.str.replace(" ", "", regex=False)
         series = series.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
         df[col] = pd.to_numeric(series, errors="coerce")
 
@@ -196,7 +216,7 @@ def main() -> None:
 
     datasets_by_label: dict[str, Dataset] = {}
     data_dir = Path(__file__).resolve().parent
-    local_files = sorted(data_dir.glob("*_All_in.csv"))
+    local_files = sorted(data_dir.glob("*_All_in*.csv"))
     for path in local_files:
         datasets_by_label[path.name] = load_dataset(path.name, path.read_bytes())
 
