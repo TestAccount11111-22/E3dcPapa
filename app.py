@@ -32,15 +32,19 @@ ALL_DATA_COLUMNS = {
     config["column"] for config in VALUE_CONFIG.values()
 }.union({"Netzeinspeisung", "Netzbezug", "Hausverbrauch", "Solarproduktion"})
 
-YEAR_PALETTE = [
-    "#F59E0B",
-    "#3B82F6",
-    "#22C55E",
-    "#6B7280",
-    "#FBBF24",
-    "#0EA5E9",
-    "#84CC16",
-]
+VALUE_COLORS = {
+    "Solarproduktion": "#F59E0B",
+    "Solarproduktion Tracker 1": "#FBBF24",
+    "Solarproduktion Tracker 2": "#F97316",
+    "Batterie Laden": "#8B5CF6",
+    "Batterie Entladen": "#A78BFA",
+    "Netzeinspeisung": "#38BDF8",
+    "Netzbezug": "#0EA5E9",
+    "Hausverbrauch": "#EF4444",
+    "Summe Wallbox Laden": "#F43F5E",
+    "Wallbox Solarladeleistung": "#14B8A6",
+    "Summe Verbrauch": "#B91C1C",
+}
 
 VALUE_ORDER = list(VALUE_CONFIG.keys())
 
@@ -101,20 +105,8 @@ def format_percent(value: Optional[float]) -> str:
     return f"{format_number_de(value, 1)} %"
 
 
-def shade_color(hex_color: str, factor: float) -> str:
-    hex_color = hex_color.lstrip("#")
-    red = int(hex_color[0:2], 16)
-    green = int(hex_color[2:4], 16)
-    blue = int(hex_color[4:6], 16)
-    red = int(red * factor + 255 * (1 - factor))
-    green = int(green * factor + 255 * (1 - factor))
-    blue = int(blue * factor + 255 * (1 - factor))
-    return f"#{red:02x}{green:02x}{blue:02x}"
-
-
-def value_shade_factor(value_name: str) -> float:
-    idx = VALUE_ORDER.index(value_name)
-    return max(0.35, 0.95 - idx * 0.06)
+def get_value_color(value_name: str) -> str:
+    return VALUE_COLORS.get(value_name, "#6B7280")
 
 
 def load_dataset(name: str, content: bytes) -> Dataset:
@@ -164,17 +156,6 @@ def load_dataset(name: str, content: bytes) -> Dataset:
     return Dataset(label=name, year=year, raw=df, monthly=df_monthly, warnings=warnings)
 
 
-def build_year_colors(labels: list[str]) -> dict[str, str]:
-    colors: dict[str, str] = {}
-    for idx, label in enumerate(labels):
-        base_color = YEAR_PALETTE[idx % len(YEAR_PALETTE)]
-        if idx >= len(YEAR_PALETTE):
-            shade = max(0.55, 0.85 - 0.1 * (idx // len(YEAR_PALETTE)))
-            base_color = shade_color(base_color, shade)
-        colors[label] = base_color
-    return colors
-
-
 def build_kpis(dataset: Dataset) -> dict[str, Optional[float]]:
     def sum_wh(column: str) -> Optional[float]:
         if column not in dataset.monthly.columns:
@@ -219,17 +200,13 @@ def main() -> None:
         for upload in uploads:
             datasets.append(load_dataset(upload.name, upload.getvalue()))
     else:
-        sample_path = Path(__file__).resolve().parent / "2026_All_in.csv"
-        if sample_path.exists():
-            use_sample = st.sidebar.checkbox(
-                "Beispieldaten laden (2026_All_in.csv)",
-                value=False,
-            )
-            if use_sample:
-                datasets.append(load_dataset(sample_path.name, sample_path.read_bytes()))
+        data_dir = Path(__file__).resolve().parent
+        local_files = sorted(data_dir.glob("*_All_in.csv"))
+        for path in local_files:
+            datasets.append(load_dataset(path.name, path.read_bytes()))
 
     if not datasets:
-        st.info("Bitte eine oder mehrere CSV-Dateien hochladen.")
+        st.info("Bitte eine oder mehrere CSV-Dateien hochladen oder CSVs im Ordner ablegen.")
         return
 
     datasets = sorted(
@@ -255,10 +232,6 @@ def main() -> None:
 
     selected_datasets = [item for item in datasets if item.label in selected_labels]
 
-    for dataset in datasets:
-        for warning in dataset.warnings:
-            st.warning(f"{dataset.display_year}: {warning}")
-
     tabs = st.tabs(["Jahr gesamt", "Monatliche Aufschluesselung", "Rohdaten"])
 
     with tabs[0]:
@@ -268,21 +241,22 @@ def main() -> None:
         elif not selected_datasets:
             st.info("Bitte mindestens ein Jahr auswaehlen.")
         else:
-            year_colors = build_year_colors([ds.label for ds in selected_datasets])
             fig_total = go.Figure()
+            shown_values: set[str] = set()
             for dataset in selected_datasets:
-                year_color = year_colors[dataset.label]
                 for value_name in selected_values:
                     column = VALUE_CONFIG[value_name]["column"]
                     total_wh = dataset.monthly[column].sum(min_count=1)
                     total_kwh = None if total_wh is None or pd.isna(total_wh) else total_wh / 1000
-                    shade = value_shade_factor(value_name)
-                    color = shade_color(year_color, shade)
+                    color = get_value_color(value_name)
+                    showlegend = value_name not in shown_values
                     fig_total.add_trace(
                         go.Bar(
                             x=[dataset.display_year],
                             y=[total_kwh],
-                            name=f"{dataset.display_year} {value_name}",
+                            name=value_name,
+                            legendgroup=value_name,
+                            showlegend=showlegend,
                             marker=dict(color=color),
                             hovertemplate=(
                                 f"{dataset.display_year}<br>{value_name}: "
@@ -290,6 +264,8 @@ def main() -> None:
                             ),
                         )
                     )
+                    if showlegend:
+                        shown_values.add(value_name)
 
             fig_total.update_layout(
                 barmode="group",
@@ -325,20 +301,21 @@ def main() -> None:
         elif not selected_datasets:
             st.info("Bitte mindestens ein Jahr auswaehlen.")
         else:
-            year_colors = build_year_colors([ds.label for ds in selected_datasets])
             fig = go.Figure()
+            shown_values: set[str] = set()
             for dataset in selected_datasets:
-                year_color = year_colors[dataset.label]
                 for value_name in selected_values:
                     column = VALUE_CONFIG[value_name]["column"]
-                    shade = value_shade_factor(value_name)
-                    color = shade_color(year_color, shade)
+                    color = get_value_color(value_name)
                     y_values = dataset.monthly[column] / 1000
+                    showlegend = value_name not in shown_values
                     fig.add_trace(
                         go.Bar(
                             x=MONTH_LABELS,
                             y=y_values,
-                            name=f"{dataset.display_year} {value_name}",
+                            name=value_name,
+                            legendgroup=value_name,
+                            showlegend=showlegend,
                             marker=dict(color=color),
                             hovertemplate=(
                                 f"%{{x}} {dataset.display_year}<br>{value_name}: "
@@ -346,6 +323,8 @@ def main() -> None:
                             ),
                         )
                     )
+                    if showlegend:
+                        shown_values.add(value_name)
 
             fig.update_layout(
                 barmode="group",
@@ -371,7 +350,6 @@ def main() -> None:
         for dataset in datasets:
             st.markdown(f"**{dataset.display_year}**")
             st.dataframe(dataset.raw, use_container_width=True)
-
 
 if __name__ == "__main__":
     main()
