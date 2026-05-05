@@ -261,7 +261,14 @@ def main() -> None:
 
     selected_datasets = [item for item in datasets if item.label in selected_labels]
 
-    tabs = st.tabs(["Jahr gesamt", "Monatliche Aufschluesselung", "Rohdaten"])
+    tabs = st.tabs(
+        [
+            "Jahr gesamt",
+            "Monatliche Aufschluesselung",
+            "Gesamt (alle Jahre)",
+            "Rohdaten",
+        ]
+    )
 
     with tabs[0]:
         st.subheader("Jahr gesamt")
@@ -376,6 +383,67 @@ def main() -> None:
             st.dataframe(table, use_container_width=True)
 
     with tabs[2]:
+        st.subheader("Gesamt (alle Jahre)")
+        if not selected_values:
+            st.info("Bitte mindestens einen Wert auswaehlen.")
+        elif not selected_datasets:
+            st.info("Bitte mindestens ein Jahr auswaehlen.")
+        else:
+            totals_by_value: dict[str, Optional[float]] = {}
+            for value_name in selected_values:
+                column = VALUE_CONFIG[value_name]["column"]
+                total_wh = 0.0
+                has_value = False
+                for dataset in selected_datasets:
+                    value = dataset.monthly[column].sum(min_count=1)
+                    if value is None or pd.isna(value):
+                        continue
+                    total_wh += float(value)
+                    has_value = True
+                totals_by_value[value_name] = total_wh if has_value else None
+
+            fig_all = go.Figure()
+            for value_name in selected_values:
+                total_wh = totals_by_value.get(value_name)
+                total_kwh = None if total_wh is None else total_wh / 1000
+                fig_all.add_trace(
+                    go.Bar(
+                        x=[value_name],
+                        y=[total_kwh],
+                        name=value_name,
+                        marker=dict(color=get_value_color(value_name)),
+                        hovertemplate=(
+                            f"{value_name}: "
+                            "%{y:.1f} kWh<extra></extra>"
+                        ),
+                    )
+                )
+
+            fig_all.update_layout(
+                barmode="group",
+                legend_title_text="Wert",
+                xaxis_title="Wert",
+                yaxis_title="kWh",
+                bargap=0.18,
+                bargroupgap=0.08,
+                template="plotly_white",
+            )
+            st.plotly_chart(fig_all, use_container_width=True)
+
+            totals_table = pd.DataFrame(
+                {
+                    "Summe (kWh)": {
+                        value_name: (
+                            None if totals_by_value[value_name] is None
+                            else totals_by_value[value_name] / 1000
+                        )
+                        for value_name in selected_values
+                    }
+                }
+            )
+            st.dataframe(totals_table, use_container_width=True)
+
+    with tabs[3]:
         for dataset in datasets:
             st.markdown(f"**{dataset.display_year}**")
             st.dataframe(dataset.raw, use_container_width=True)
